@@ -169,3 +169,39 @@ app.get("/health", (req, res) => res.send("ok"));
 
 const PORT_ENV = process.env.PORT || 3000;
 app.listen(PORT_ENV, () => console.log("nowplaying running on :" + PORT_ENV));
+
+// === PROXY DE STREAM CON CORS ===
+app.get("/stream", async (req, res) => {
+  const upstream = "https://uk5freenew.listen2myradio.com/live.mp3?typeportmount=s1_6345_stream_898887520";
+  try {
+    const controller = new AbortController();
+    req.on("close", () => controller.abort());
+
+    const r = await fetch(upstream, {
+      signal: controller.signal,
+      headers: { "User-Agent": "Mozilla/5.0" }
+    });
+    if (!r.ok || !r.body) {
+      res.status(502).set("access-control-allow-origin", "*").json({ error: "upstream" });
+      return;
+    }
+    // CORS + tipo de audio
+    res.writeHead(200, {
+      "Content-Type": "audio/mpeg",
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "no-store",
+      // estas dos ayudan a algunos players
+      "Accept-Ranges": "bytes",
+      "Connection": "keep-alive"
+    });
+
+    // pipe del cuerpo (streaming)
+    r.body.on("error", () => { try { res.end(); } catch {} });
+    r.body.pipe(res);
+  } catch (e) {
+    try {
+      res.status(500).set("access-control-allow-origin", "*").json({ error: "proxy" });
+    } catch {}
+  }
+});
+
