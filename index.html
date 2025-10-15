@@ -61,4 +61,164 @@
       flex:1 1 220px; display:flex; gap:10px; align-items:center;
       padding:10px 12px; border-radius:12px; background:#202457; border:1px solid #2f367b;
     }
-    .vol input[type="ran]()
+    .vol input[type="range"]{ width:100% }
+    .tiny{ font-size:12px; color:#aeb6ea }
+    .hud{ display:flex; gap:12px; align-items:center; color:#aeb6ea; font-size:12px; margin-top:10px }
+    .okdot{ width:8px; height:8px; border-radius:50%; background:var(--ok); box-shadow:0 0 0 6px #2ecc7130 }
+    .errdot{ width:8px; height:8px; border-radius:50%; background:#ff4d4d; box-shadow:0 0 0 6px #ff4d4d30 }
+    .footer{ text-align:center; color:#aeb6ea; font-size:13px; opacity:.9 }
+    a.btn{ text-decoration:none; color:#e7eaff; border:1px solid #3b4495; background:#2a2f64; padding:10px 14px; border-radius:12px; font-weight:600 }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="header">
+        <div class="logo">🎧</div>
+        <div class="title">
+          <h1>Hombres G Radio</h1>
+          <div class="sub">Transmisión en vivo — SHOUTcast (SSL del proveedor)</div>
+        </div>
+        <div class="livepill"><span class="dot"></span> En vivo</div>
+      </div>
+
+      <div class="now">
+        <div id="song" class="song">Conéctate y disfruta</div>
+        <div id="artist" class="artist">Hombres G Radio</div>
+      </div>
+
+      <div class="controls">
+        <button id="playBtn">▶️ Reproducir</button>
+        <button id="stopBtn" class="ghost">⏹️ Detener</button>
+
+        <div class="vol">
+          <span class="tiny">Volumen</span>
+          <input id="vol" type="range" min="0" max="1" step="0.01" value="0.85" />
+        </div>
+
+        <span class="pill">MP3</span>
+      </div>
+
+      <div class="hud">
+        <span id="streamDot" class="errdot"></span>
+        <span id="streamMsg">Listo para reproducir</span>
+        <span id="sourceTag" class="tiny" style="margin-left:auto"></span>
+      </div>
+    </div>
+
+    <div class="footer">
+      © <script>document.write(new Date().getFullYear())</script> Hombres G Radio
+    </div>
+  </div>
+
+  <!-- Audio SIN crossorigin y SIN autoplay -->
+  <audio id="player" preload="none" playsinline></audio>
+
+  <script>
+    // ====== CONFIG ======
+    const STREAM_URL   = "https://uk5freenew.listen2myradio.com/live.mp3?typeportmount=s1_6345_stream_898887520";
+    const NOW_ENDPOINT = "https://radio-ok.onrender.com/now";
+    const POLL_MS = 15000;
+
+    // ====== DOM ======
+    const audio     = document.getElementById('player');
+    const playBtn   = document.getElementById('playBtn');
+    const stopBtn   = document.getElementById('stopBtn');
+    const vol       = document.getElementById('vol');
+    const songEl    = document.getElementById('song');
+    const artistEl  = document.getElementById('artist');
+    const streamDot = document.getElementById('streamDot');
+    const streamMsg = document.getElementById('streamMsg');
+    const sourceTag = document.getElementById('sourceTag');
+
+    // Estado
+    let started = false;
+    let lastStartTs = 0;
+
+    // Init mínimo
+    audio.preload = "none";
+    audio.setAttribute("playsinline", "");
+    audio.volume = parseFloat(vol.value);
+
+    function setHUD(ok, msg){
+      streamDot.className = ok ? 'okdot' : 'errdot';
+      streamMsg.textContent = msg || (ok ? 'OK' : 'Inactivo');
+    }
+
+    // ====== Reproducir tras clic ======
+    async function startPlayback(forceReload=false){
+      try{
+        if (!audio.src || forceReload) {
+          const bust = (STREAM_URL.includes("?") ? "&" : "?") + "t=" + Date.now();
+          audio.src = STREAM_URL + (forceReload ? bust : "");
+          audio.load();
+        }
+        try {
+          const AC = window.AudioContext || window.webkitAudioContext;
+          if (AC) {
+            window.__ctx = window.__ctx || new AC();
+            if (window.__ctx.state === 'suspended') await window.__ctx.resume();
+          }
+        } catch {}
+        await audio.play();
+        started = true;
+        lastStartTs = Date.now();
+        playBtn.textContent = '⏸️ Pausar';
+        setHUD(true, 'Reproduciendo');
+      } catch (e) {
+        setHUD(false, 'No se pudo iniciar. Reintenta.');
+        console.debug('play() error:', e);
+      }
+    }
+
+    // Controles
+    playBtn.addEventListener('click', async () => {
+      if (audio.paused) {
+        await startPlayback();
+      } else {
+        audio.pause();
+        playBtn.textContent = '▶️ Reproducir';
+        setHUD(false, 'Pausado');
+      }
+    });
+
+    stopBtn.addEventListener('click', () => {
+      audio.pause();
+      audio.removeAttribute('src');
+      audio.load();
+      playBtn.textContent = '▶️ Reproducir';
+      setHUD(false, 'Detenido');
+      started = false;
+    });
+
+    vol.addEventListener('input', () => {
+      audio.volume = parseFloat(vol.value);
+    });
+
+    audio.addEventListener('playing', () => setHUD(true, 'Reproduciendo'));
+    audio.addEventListener('pause',   () => setHUD(false, 'Pausado'));
+    audio.addEventListener('stalled', () => setHUD(false, 'Reconectando…'));
+    audio.addEventListener('error',   async () => {
+      setHUD(false, 'Error de reproducción');
+      if (started && Date.now() - lastStartTs > 1500) {
+        setTimeout(() => startPlayback(true), 1500);
+      }
+    });
+
+    // ====== Now Playing ======
+    async function fetchNow(){
+      try{
+        const r = await fetch(NOW_ENDPOINT, { cache: 'no-store' });
+        const data = await r.json();
+        if (data && (data.title || data.artist)) {
+          if (data.title)  songEl.textContent   = data.title;
+          if (data.artist) artistEl.textContent = data.artist;
+          sourceTag.textContent = data.source ? `Fuente: ${data.source}` : '';
+        }
+      }catch(e){}
+    }
+    setInterval(fetchNow, POLL_MS);
+    fetchNow();
+  </script>
+</body>
+</html>
