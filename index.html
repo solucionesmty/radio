@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Hombres G Radio — En vivo</title>
+  <meta name="description" content="Hombres G Radio — transmisión en vivo 24/7." />
+  <link rel="preconnect" href="https://uk5freenew.listen2myradio.com" crossorigin>
+  <style>
+    :root{
+      --bg1:#0f1022; --bg2:#1a1c3a; --card:#1b1f4a;
+      --txt:#eef1ff; --muted:#a8b0d9; --brand:#7c9bff; --accent:#ffd166; --ok:#2ecc71;
+      --shadow1: 0 10px 30px rgb(0 0 0 / .35), inset 0 1px 0 rgba(255,255,255,.04);
+      --radius: 22px;
+    }
+    *{ box-sizing: border-box }
+    body{
+      margin:0; min-height:100svh;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Inter, "Helvetica Neue", Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji";
+      color:var(--txt);
+      background:
+        radial-gradient(1200px 800px at 20% -10%, #2a2e6f40, transparent 60%),
+        radial-gradient(900px 700px at 85% 15%, #5b2cff33, transparent 60%),
+        linear-gradient(160deg, var(--bg1), var(--bg2));
+      display:grid; place-items:center; padding:32px;
+    }
+    .wrap{
+      width:min(880px, 100%); display:grid; gap:22px;
+    }
+    .card{
+      background: linear-gradient(180deg, #1b1f4acc, #171a3fcc);
+      border:1px solid #2a3168;
+      border-radius:var(--radius);
+      box-shadow: var(--shadow1);
+      backdrop-filter: blur(10px);
+      padding:24px;
+    }
+    .header{ display:flex; align-items:center; gap:16px }
+    .logo{
+      width:64px; height:64px; border-radius:18px;
+      background: conic-gradient(from 210deg, #ff7aa8, #7d8cff, #35e0b9, #ffd166, #ff7aa8);
+      display:grid; place-items:center; color:#111; font-weight:700;
+      box-shadow: 0 6px 20px rgba(124,155,255,.35);
+      user-select:none;
+    }
+    .title h1{ margin:0; font-size: clamp(20px, 3.0vw, 28px); letter-spacing:.2px }
+    .title .sub{ color:var(--muted); font-size:14px; margin-top:2px }
+    .livepill{
+      display:inline-flex; align-items:center; gap:8px; padding:6px 10px; border-radius:999px;
+      background:#2a2f64; color:#cfd6ff; font-size:12px; border:1px solid #3a4290;
+    }
+    .dot{ width:8px; height:8px; border-radius:50%; background: #ff4d4d; box-shadow:0 0 0 6px #ff4d4d33 }
+    .now{
+      display:grid; gap:8px; margin:18px 0 6px;
+    }
+    .song{ font-size: clamp(26px, 4.8vw, 40px); font-weight:800; line-height:1.1 }
+    .artist{ font-size: clamp(18px, 3.2vw, 22px); color:#c9cffc; opacity:.95 }
+    .controls{
+      margin-top:16px; display:flex; gap:12px; align-items:center; flex-wrap:wrap;
+    }
+    button{
+      appearance:none; border:none; cursor:pointer; color:#121326; font-weight:700;
+      padding:12px 16px; border-radius:14px; background:var(--accent);
+      box-shadow: 0 8px 20px rgba(255,209,102,.30);
+      transition: transform .05s ease;
+    }
+    button:active{ transform: translateY(1px) }
+    .ghost{
+      background:#2a2f64; color:#e7eaff; border:1px solid #3b4495; box-shadow:none;
+    }
+    .pill{
+      padding:10px 12px; font-weight:600; background:#2b305f; color:#e7eaff; border:1px solid #3b4495;
+    }
+    .vol{
+      flex:1 1 220px; display:flex; gap:10px; align-items:center;
+      padding:10px 12px; border-radius:12px; background:#202457; border:1px solid #2f367b;
+    }
+    .vol input[type="range"]{ width:100% }
+    .tiny{ font-size:12px; color:#aeb6ea }
+    .footer{
+      text-align:center; color:#aeb6ea; font-size:13px;
+      opacity:.9;
+    }
+    .success{ color:var(--ok) }
+    .warn{ color:#ffbb33 }
+    .links{ display:flex; gap:10px; flex-wrap:wrap }
+    a.btn{
+      text-decoration:none; color:#e7eaff; border:1px solid #3b4495;
+      background:#2a2f64; padding:10px 14px; border-radius:12px; font-weight:600;
+    }
+
+    /* small HUD for status */
+    .hud{ display:flex; gap:12px; align-items:center; color:#aeb6ea; font-size:12px }
+    .okdot{ width:8px; height:8px; border-radius:50%; background:var(--ok); box-shadow:0 0 0 6px #2ecc7130 }
+    .errdot{ width:8px; height:8px; border-radius:50%; background:#ff4d4d; box-shadow:0 0 0 6px #ff4d4d30 }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="header">
+        <div class="logo">🎧</div>
+        <div class="title">
+          <h1>Hombres G Radio</h1>
+          <div class="sub">Transmisión en vivo — SHOUTcast (SSL del proveedor)</div>
+        </div>
+        <div style="margin-left:auto" class="livepill"><span class="dot"></span> En vivo</div>
+      </div>
+
+      <div class="now">
+        <div id="song" class="song">Conéctate y disfruta</div>
+        <div id="artist" class="artist">Hombres G Radio</div>
+      </div>
+
+      <div class="controls">
+        <button id="playBtn">▶️ Reproducir</button>
+        <button id="stopBtn" class="ghost">⏹️ Detener</button>
+
+        <div class="vol">
+          <span class="tiny">Volumen</span>
+          <input id="vol" type="range" min="0" max="1" step="0.01" value="0.85" />
+        </div>
+
+        <a id="openDirect" class="btn" target="_blank" rel="noopener">Abrir directo</a>
+        <span id="fmt" class="pill">MP3</span>
+      </div>
+
+      <div style="display:flex; justify-content:space-between; margin-top:12px; align-items:center;">
+        <div class="hud"><span id="streamDot" class="errdot"></span><span id="streamMsg">Listo para reproducir</span></div>
+        <span id="sourceTag" class="tiny"></span>
+      </div>
+    </div>
+
+    <div class="footer">
+      <span>© <script>document.write(new Date().getFullYear())</script> Hombres G Radio</span>
+    </div>
+  </div>
+
+  <!-- Audio oculto -->
+<audio id="player" preload="none" playsinline crossorigin="anonymous"></audio>
+
+  <script>
+  // ====== CONFIG ======
+  const STREAM_URL = "https://uk5freenew.listen2myradio.com/live.mp3?typeportmount=s1_6345_stream_898887520";
+  const NOW_ENDPOINT = "https://radio-ok.onrender.com/now";
+  const POLL_MS = 15000;
+
+  // ====== DOM ======
+  const audio = document.getElementById('player');
+  const playBtn = document.getElementById('playBtn');
+  const stopBtn = document.getElementById('stopBtn');
+  const vol = document.getElementById('vol');
+  const songEl = document.getElementById('song');
+  const artistEl = document.getElementById('artist');
+  const openDirect = document.getElementById('openDirect');
+  const streamDot = document.getElementById('streamDot');
+  const streamMsg = document.getElementById('streamMsg');
+  const sourceTag = document.getElementById('sourceTag');
+
+  // audio: no pongas src todavía (iOS prefiere asignarlo tras el gesto)
+  audio.preload = "none";
+  audio.setAttribute("playsinline", "");  // iOS
+  audio.crossOrigin = "anonymous";
+  audio.volume = parseFloat(vol.value);
+  openDirect.href = STREAM_URL;
+
+  let started = false;
+  let lastStartTs = 0;
+
+  function setHUD(ok, msg){
+    streamDot.className = ok ? 'okdot' : 'errdot';
+    streamMsg.textContent = msg || (ok ? 'OK' : 'Inactivo');
+  }
+
+  // ====== INICIAR REPRODUCCIÓN (siempre tras gesto del usuario) ======
+  async function startPlayback(forceReload=false){
+    try{
+      // iOS/Chrome móvil: asigna/recarga la URL después del gesto
+      if (!audio.src || forceReload) {
+        const bust = (STREAM_URL.includes("?") ? "&" : "?") + "t=" + Date.now();
+        audio.src = STREAM_URL + (forceReload ? bust : "");
+        audio.load();
+      }
+
+      // Desbloquear WebAudio si aplica (algunos navegadores lo piden)
+      try {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (AC) {
+          window.__ctx = window.__ctx || new AC();
+          if (window.__ctx.state === 'suspended') await window.__ctx.resume();
+        }
+      } catch {}
+
+      await audio.play();
+      started = true;
+      lastStartTs = Date.now();
+      playBtn.textContent = '⏸️ Pausar';
+      setHUD(true, 'Reproduciendo');
+    } catch (e) {
+      setHUD(false, 'No se pudo iniciar. Reintenta.');
+      console.debug('play() error:', e);
+    }
+  }
+
+  // ====== Controles ======
+  playBtn.addEventListener('click', async () => {
+    if (audio.paused) {
+      await startPlayback();
+    } else {
+      audio.pause();
+      playBtn.textContent = '▶️ Reproducir';
+      setHUD(false, 'Pausado');
+    }
+  });
+
+  stopBtn.addEventListener('click', () => {
+    audio.pause();
+    audio.removeAttribute('src'); // libera el stream
+    audio.load();
+    playBtn.textContent = '▶️ Reproducir';
+    setHUD(false, 'Detenido');
+    started = false;
+  });
+
+  vol.addEventListener('input', () => {
+    audio.volume = parseFloat(vol.value);
+  });
+
+  // También inicia si el usuario toca cualquier parte de la tarjeta principal (primer gesto)
+  document.querySelector('.card').addEventListener('click', async (ev) => {
+    if (!started && !ev.target.closest('button') && !ev.target.closest('a') && !ev.target.closest('input')) {
+      await startPlayback();
+    }
+  }, { once: true });
+
+  // Eventos del elemento <audio>
+  audio.addEventListener('playing', () => setHUD(true, 'Reproduciendo'));
+  audio.addEventListener('pause',   () => setHUD(false, 'Pausado'));
+  audio.addEventListener('stalled', () => setHUD(false, 'Reconectando…'));
+  audio.addEventListener('error',   async () => {
+    setHUD(false, 'Error de reproducción');
+    // si ya habíamos empezado y falló, intenta reenganchar tras 1.5s
+    if (started && Date.now() - lastStartTs > 1500) {
+      setTimeout(() => startPlayback(true), 1500);
+    }
+  });
+
+  // ====== NOW PLAYING (poll) ======
+  async function fetchNow(){
+    try{
+      const r = await fetch(NOW_ENDPOINT, { cache: 'no-store' });
+      const data = await r.json();
+      if (data && (data.title || data.artist)) {
+        if (data.title)  songEl.textContent   = data.title;
+        if (data.artist) artistEl.textContent = data.artist;
+        sourceTag.textContent = data.source ? `Fuente: ${data.source}` : '';
+      }
+    }catch(e){
+      // mantenemos lo último conocido
+    }
+  }
+  setInterval(fetchNow, POLL_MS);
+  fetchNow();
+</script>
+
+</body>
+</html>
