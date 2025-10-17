@@ -1,206 +1,280 @@
+// server.js — Backend Radio (Render)
+// Node 18+, "type": "module" en package.json
+
 import express from "express";
+import { fetch, Agent } from "undici";
+import { Readable } from "node:stream";
+import iconv from "iconv-lite";
 
-// ----------- Utils -----------
-const ORIGIN  = "https://hombresg.radio12345.com";
-const INDEX   = `${ORIGIN}/index.php`;
-const AJAX    = `${ORIGIN}/getRecentSong.ajax.php`;
-const HOST    = "uk5freenew.listen2myradio.com";
-const PORT    = "6345";
-const HTTP    = `http://${HOST}:${PORT}`;
+const app = express();
 
-const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+/* =================== Config =================== */
+const STATION_PAGE = "https://hombresg.radio12345.com/index.php";
+const RADIO_AJAX   = "https://hombresg.radio12345.com/getRecentSong.ajax.php";
 
-function json(res, data, status = 200) {
-  res.status(status)
-     .set("cache-control", "no-store")
-     .set("access-control-allow-origin", "*")
-     .json(data);
+const UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36";
+
+const agent = new Agent({
+  keepAliveTimeout: 30_000,
+  keepAliveMaxTimeout: 60_000,
+  headersTimeout: 30_000,
+  bodyTimeout: 0,
+});
+
+/* =================== Utils =================== */
+function clean(s) {
+  return String(s || "")
+    .replace(/\s+/g, " ")
+    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+    .trim();
+}
+function stripTags(html) {
+  return clean(String(html).replace(/<[^>]+>/g, " "));
 }
 
-function splitSong(s) {
-  const str = String(s || "").trim();
-  for (const sep of [" - ", " — ", " ~ ", " | "]) {
-    const i = str.indexOf(sep);
-    if (i > -1) return { artist: str.slice(0, i).trim(), title: str.slice(i + sep.length).trim() };
+/** Decodifica texto respetando charset (cabecera o meta) */
+async function fetchTextSmart(url, options = {}) {
+  const r = await fetch(url, { dispatcher: agent, ...options });
+  const buf = Buffer.from(await r.arrayBuffer());
+  let ct = String(r.headers.get("content-type") || "").toLowerCase();
+
+  // 1) charset desde cabecera
+  let enc = (ct.match(/charset=([\w-]+)/)?.[1] || "").toLowerCase();
+
+  // 2) si no hay, intenta meta charset en el HTML
+  if (!enc) {
+    const head = buf.slice(0, 4096).toString("latin1"); // no asumimos utf8 aún
+    enc = (head.match(/<meta[^>]*charset=["']?([\w-]+)["']?/i)?.[1] || "").toLowerCase();
   }
-  return { artist: "", title: str };
+
+  // 3) normaliza alias comunes
+  if (!enc) enc = "utf-8";
+  if (enc === "utf8") enc = "utf-8";
+  if (enc === "iso-8859-1" || enc === "latin-1") enc = "latin1";
+
+  const text = iconv.decode(buf, enc).normalize("NFC");
+  return { ok: r.ok, status: r.status, headers: r.headers, contentType: ct, text };
 }
 
-function stripTags(s) {
-  return String(s || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-}
-
-function parseItemsFromHtml(html) {
-  const lis = [...String(html).matchAll(/<li\b[^>]*>([\s\S]*?)<\/li>/gi)].map(m => m[1]);
+function parseFromHtml(html) {
   const out = [];
-  for (const li of lis) {
-    const mTitle  = li.match(/<div[^>]*class=["'][^"']*list_title[^"']*["'][^>]*>[\s\S]*?<a[^>]*>([\s\S]*?)<\/a>/i);
-    const mArtist = li.match(/<div[^>]*class=["'][^"']*list_title[^"']*["'][^>]*>[\s\S]*?<label[^>]*>([\s\S]*?)<\/label>/i);
-    let title  = stripTags(mTitle  ? mTitle[1]  : "");
-    let artist = stripTags(mArtist ? mArtist[1] : "");
-    if (!title || !artist) {
-      const plain = stripTags(li);
-      const sp = splitSong(plain);
-      title = title || sp.title;
-      artist = artist || sp.artist;
+  const txt = clean(html);
+  const li = Array.from(txt.matchAll(/<li[^>]*>([\s\S]*?)<\/li>/gi)).map((m) => m[1]);
+
+  for (const block of li) {
+    const title = (block.match(/class=["']?list_title[^>]*>\s*<a[^>]*>([\s\S]*?)<\/a>/i) || [])[1];
+    const artist = (block.match(/<label[^>]*>([\s\S]*?)<\/label>/i) || [])[1];
+    const t = clean(stripTags(title));
+    const a = clean(stripTags(artist));
+    if (t || a) out.push({ title: t, artist: a });
+  }
+
+  if (!out.length) {
+    const plain = stripTags(txt);
+    const first = plain.split(/\s{2,}|\n/).find(Boolean) || plain;
+    const seps = [" - ", " — ", " – ", " | ", ": "];
+    for (const sep of seps) {
+      const i = first.indexOf(sep);
+      if (i > 0) {
+        out.push({ artist: first.slice(0, i).trim(), title: first.slice(i + sep.length).trim() });
+        break;
+      }
     }
-    if (title || artist) out.push({ title, artist });
   }
   return out;
 }
 
-function parse7html(text) {
-  const t = String(text || "").replace(/<[^>]+>/g, " ").trim();
-  const parts = t.split(",").map(s => s.trim()).filter(Boolean);
-  const song = parts[parts.length - 1] || "";
-  const br   = parts.find(p => /^\d{2,4}$/.test(p));
-  const { artist, title } = splitSong(song);
-  return { artist, title, bitrate: br ? `${br} kbps` : "" };
-}
+/* =================== Resolver URL del stream =================== */
+let cachedUrl = null;
+let cachedAt = 0;
+const CACHE_MS = 90_000;
 
-function pickIceStats(j) {
-  const s = Array.isArray(j?.icestats?.source) ? j.icestats.source[0] : (j?.icestats?.source || {});
-  const song = s.title || s.song || "";
-  const { artist, title } = splitSong(song);
-  const br = s.bitrate ? `${s.bitrate} kbps` : "";
-  return { artist, title, bitrate: br };
-}
+async function resolveUpstreamURL() {
+  const now = Date.now();
+  if (cachedUrl && now - cachedAt < CACHE_MS) return cachedUrl;
 
-// ----------- Scrapers -----------
-async function fetchAjaxWithSession() {
-  // 1) abre index para obtener cookies
-  const pre = await fetch(INDEX, {
-    headers: { "user-agent": UA, "accept": "text/html,*/*" },
-    redirect: "follow"
-  });
-  const set = pre.headers.get("set-cookie") || "";
-  const cookie = set
-    .split(/,(?=\s*\w+=)/)
-    .map(s => s.split(";")[0].trim())
-    .filter(Boolean)
-    .join("; ");
-
-  // 2) POST ajax (urlencoded)
-  const r = await fetch(AJAX, {
-    method: "POST",
+  const { text: html } = await fetchTextSmart(STATION_PAGE, {
     headers: {
-      "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-      "x-requested-with": "XMLHttpRequest",
-      "origin": ORIGIN,
-      "referer": INDEX,
-      "user-agent": UA,
-      "cookie": cookie
+      "User-Agent": UA,
+      Accept: "text/html,*/*",
+      "Accept-Language": "es-MX,es;q=0.9,en;q=0.8",
+      Connection: "keep-alive",
     },
-    body: new URLSearchParams({ _ts: Date.now().toString() }),
-    redirect: "follow"
   });
 
-  const txt = await r.text();
-  let j;
-  try { j = JSON.parse(txt); } catch { j = {}; }
-  const html = j?.html || "";
-  const items = parseItemsFromHtml(html);
-  if (items.length) {
-    const now = items[0];
-    return { artist: now.artist, title: now.title, source: "ajax" };
-  }
-  throw new Error("ajax-empty");
-}
-
-async function fetchIndexHtml() {
-  const r = await fetch(`${HTTP}/index.html`, { headers: { "user-agent": UA } });
-  const html = await r.text();
-  const m = html.match(/Current Song:\s*([^<]+)/i);
+  let m = html.match(/id=["']urladdress["'][^>]*>\s*([^<\s][^<]*?)\s*<\/div>/i);
   if (m && m[1]) {
-    const { artist, title } = splitSong(m[1].trim());
-    return { artist, title, source: "index.html" };
+    const url = m[1].trim();
+    if (url.startsWith("http")) {
+      cachedUrl = url;
+      cachedAt = now;
+      return url;
+    }
   }
-  throw new Error("no-current-song");
+  m = html.match(/https?:\/\/[^\s"'<>]+live\.mp3\?typeportmount=[^"'<>\s]+/i);
+  if (m) {
+    cachedUrl = m[0];
+    cachedAt = now;
+    return cachedUrl;
+  }
+
+  cachedUrl = "http://uk5freenew.listen2myradio.com:6345/;stream.mp3";
+  cachedAt = now;
+  return cachedUrl;
 }
 
-async function fetch7Html() {
-  const r = await fetch(`${HTTP}/7.html`, { headers: { "user-agent": UA } });
-  const txt = await r.text();
-  const { artist, title, bitrate } = parse7html(txt);
-  if (artist || title) return { artist, title, bitrate, source: "7.html" };
-  throw new Error("7html-empty");
-}
+/* =================== Endpoints =================== */
+app.get("/", (_req, res) => res.type("text/plain").send("OK"));
 
-async function fetchStatusJson() {
-  const r = await fetch(`${HTTP}/status-json.xsl`, { headers: { "user-agent": UA } });
-  const j = await r.json();
-  const out = pickIceStats(j);
-  if (out.artist || out.title) return { ...out, source: "status-json" };
-  throw new Error("status-empty");
-}
-
-// ----------- Express app -----------
-const app = express();
-
-app.get("/now", async (req, res) => {
+// ---- /now con decodificación segura (adiós mojibake) ----
+app.get("/now", async (_req, res) => {
   try {
-    // 1) AJAX con sesión (HTTPS del proveedor)
-    try {
-      const x = await fetchAjaxWithSession();
-      return json(res, x);
-    } catch {}
+    const { text, contentType } = await fetchTextSmart(RADIO_AJAX, {
+      method: "POST",
+      headers: {
+        "User-Agent": UA,
+        Accept: "application/json,text/html,*/*",
+        "Content-Type": "application/x-www-form-urlencoded",
+        Origin: "https://hombresg.radio12345.com",
+        Referer: "https://hombresg.radio12345.com/",
+      },
+      body: "x=1",
+    });
 
-    // 2) SHOUTcast en claro (si no lo bloquea la red del host)
-    try {
-      const x = await fetchIndexHtml();
-      return json(res, x);
-    } catch {}
-    try {
-      const x = await fetch7Html();
-      return json(res, x);
-    } catch {}
-    try {
-      const x = await fetchStatusJson();
-      return json(res, x);
-    } catch {}
+    let items = [];
+    if ((contentType || "").includes("application/json")) {
+      try {
+        const j = JSON.parse(text);
+        if (j && j.html) items = parseFromHtml(j.html);
+        if (!items.length && Array.isArray(j.history)) {
+          for (const h of j.history) {
+            const t = clean(h.title || h.song || "");
+            const a = clean(h.artist || "");
+            if (t || a) items.push({ title: t, artist: a });
+          }
+        }
+        // bitrate si viene en json (a veces no aplica):
+        const bitrate = clean(j?.bitrate || "");
+        const now = items[0] || { artist: "", title: "" };
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        res.type("application/json; charset=utf-8").send(
+          JSON.stringify({ artist: now.artist, title: now.title, bitrate, source: "ajax-json" })
+        );
+        return;
+      } catch {
+        // caemos a parseo HTML/texto
+      }
+    }
 
-    return json(res, { artist: "", title: "", source: "none" }, 502);
-  } catch (e) {
-    return json(res, { artist: "", title: "", source: "error" }, 502);
+    // respuesta text/html: parsea HTML
+    items = parseFromHtml(text);
+    const now = items[0] || { artist: "", title: "" };
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.type("application/json; charset=utf-8").send(
+      JSON.stringify({ artist: now.artist, title: now.title, bitrate: "", source: "v7.html" })
+    );
+  } catch (err) {
+    res
+      .status(502)
+      .type("application/json; charset=utf-8")
+      .send(JSON.stringify({ artist: "", title: "", source: "error", msg: String(err) }));
   }
 });
 
-app.get("/health", (req, res) => res.send("ok"));
-
-const PORT_ENV = process.env.PORT || 3000;
-app.listen(PORT_ENV, () => console.log("nowplaying running on :" + PORT_ENV));
-
-// === PROXY DE STREAM CON CORS ===
-app.get("/stream", async (req, res) => {
-  const upstream = "https://uk5freenew.listen2myradio.com/live.mp3?typeportmount=s1_6345_stream_898887520";
+// ---- /diag ----
+app.get("/diag", async (_req, res) => {
   try {
-    const controller = new AbortController();
-    req.on("close", () => controller.abort());
-
-    const r = await fetch(upstream, {
-      signal: controller.signal,
-      headers: { "User-Agent": "Mozilla/5.0" }
+    const url = await resolveUpstreamURL();
+    const r = await fetch(url, {
+      dispatcher: agent,
+      method: "GET",
+      headers: {
+        "User-Agent": UA,
+        Accept: "*/*",
+        "Accept-Language": "es-MX,es;q=0.9,en;q=0.8",
+        "Icy-MetaData": "0",
+        Connection: "keep-alive",
+        Referer: "https://hombresgradio.com/",
+        Origin: "https://hombresgradio.com",
+      },
     });
-    if (!r.ok || !r.body) {
-      res.status(502).set("access-control-allow-origin", "*").json({ error: "upstream" });
+    const reader = r.body?.getReader?.();
+    let bytes = 0;
+    if (reader) {
+      while (bytes < 65536) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        if (chunk.value) bytes += chunk.value.byteLength;
+      }
+    }
+    res.json({
+      ok: r.ok,
+      status: r.status,
+      ct: r.headers.get("content-type"),
+      bytes,
+      urlUsed: url,
+      cachedAgeMs: Date.now() - cachedAt,
+    });
+  } catch (e) {
+    res.status(502).json({ ok: false, error: String(e) });
+  }
+});
+
+// ---- /stream ----
+app.get("/stream", async (req, res) => {
+  res.setHeader("Content-Type", "audio/mpeg");
+  res.setHeader("Content-Disposition", 'inline; filename="live.mp3"');
+  res.setHeader("Cache-Control", "no-store, no-transform, must-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Accept-Ranges", "none");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+
+  const ac = new AbortController();
+  const onClose = () => ac.abort();
+  req.on("close", onClose);
+  req.on("aborted", onClose);
+
+  try {
+    const upstreamURL = await resolveUpstreamURL();
+    const upstream = await fetch(upstreamURL, {
+      dispatcher: agent,
+      method: "GET",
+      headers: {
+        "User-Agent": UA,
+        Accept: "*/*",
+        "Accept-Language": "es-MX,es;q=0.9,en;q=0.8",
+        "Icy-MetaData": "0",
+        Connection: "keep-alive",
+        Referer: "https://hombresgradio.com/",
+        Origin: "https://hombresgradio.com",
+      },
+      signal: ac.signal,
+    });
+
+    if (!upstream.ok || !upstream.body) {
+      res.status(502).json({ error: "upstream", code: upstream.status });
       return;
     }
-    // CORS + tipo de audio
-    res.writeHead(200, {
-      "Content-Type": "audio/mpeg",
-      "Access-Control-Allow-Origin": "*",
-      "Cache-Control": "no-store",
-      // estas dos ayudan a algunos players
-      "Accept-Ranges": "bytes",
-      "Connection": "keep-alive"
-    });
 
-    // pipe del cuerpo (streaming)
-    r.body.on("error", () => { try { res.end(); } catch {} });
-    r.body.pipe(res);
-  } catch (e) {
-    try {
-      res.status(500).set("access-control-allow-origin", "*").json({ error: "proxy" });
-    } catch {}
+    res.flushHeaders?.();
+    const nodeStream = Readable.fromWeb(upstream.body);
+    nodeStream.on("error", () => {
+      if (!res.headersSent) res.status(502);
+      res.end();
+    });
+    res.on("error", () => ac.abort());
+
+    nodeStream.pipe(res);
+  } catch (err) {
+    if (!res.headersSent) {
+      res.status(502).json({ error: "proxy", msg: String(err) });
+    } else {
+      res.end();
+    }
   }
 });
+
+/* Puerto */
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log("radio backend listening on", PORT));
