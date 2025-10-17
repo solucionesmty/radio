@@ -1,280 +1,186 @@
-// server.js — Backend Radio (Render)
-// Node 18+, "type": "module" en package.json
-
-import express from "express";
-import { fetch, Agent } from "undici";
-import { Readable } from "node:stream";
-import iconv from "iconv-lite";
+// server.js
+import express from 'express';
+import { Agent, fetch, request } from 'undici';
+import iconv from 'iconv-lite';
 
 const app = express();
 
-/* =================== Config =================== */
-const STATION_PAGE = "https://hombresg.radio12345.com/index.php";
-const RADIO_AJAX   = "https://hombresg.radio12345.com/getRecentSong.ajax.php";
-
-const UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36";
-
+// ---------- Undici Agent (keep-alive) ----------
 const agent = new Agent({
-  keepAliveTimeout: 30_000,
+  keepAliveTimeout: 60_000,
   keepAliveMaxTimeout: 60_000,
-  headersTimeout: 30_000,
-  bodyTimeout: 0,
 });
+const undiciOpts = { dispatcher: agent };
 
-/* =================== Utils =================== */
-function clean(s) {
-  return String(s || "")
-    .replace(/\s+/g, " ")
-    .replace(/[\u200B-\u200D\uFEFF]/g, "")
+// ---------- Utilidades ----------
+const CORS = (res) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Range');
+  res.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
+};
+
+const clean = (s = '') =>
+  String(s)
+    .replace(/\s+/g, ' ')
+    .replace(/\0/g, '')
     .trim();
-}
-function stripTags(html) {
-  return clean(String(html).replace(/<[^>]+>/g, " "));
-}
 
-/** Decodifica texto respetando charset (cabecera o meta) */
-async function fetchTextSmart(url, options = {}) {
-  const r = await fetch(url, { dispatcher: agent, ...options });
-  const buf = Buffer.from(await r.arrayBuffer());
-  let ct = String(r.headers.get("content-type") || "").toLowerCase();
-
-  // 1) charset desde cabecera
-  let enc = (ct.match(/charset=([\w-]+)/)?.[1] || "").toLowerCase();
-
-  // 2) si no hay, intenta meta charset en el HTML
-  if (!enc) {
-    const head = buf.slice(0, 4096).toString("latin1"); // no asumimos utf8 aún
-    enc = (head.match(/<meta[^>]*charset=["']?([\w-]+)["']?/i)?.[1] || "").toLowerCase();
-  }
-
-  // 3) normaliza alias comunes
-  if (!enc) enc = "utf-8";
-  if (enc === "utf8") enc = "utf-8";
-  if (enc === "iso-8859-1" || enc === "latin-1") enc = "latin1";
-
-  const text = iconv.decode(buf, enc).normalize("NFC");
-  return { ok: r.ok, status: r.status, headers: r.headers, contentType: ct, text };
-}
-
-function parseFromHtml(html) {
-  const out = [];
-  const txt = clean(html);
-  const li = Array.from(txt.matchAll(/<li[^>]*>([\s\S]*?)<\/li>/gi)).map((m) => m[1]);
-
-  for (const block of li) {
-    const title = (block.match(/class=["']?list_title[^>]*>\s*<a[^>]*>([\s\S]*?)<\/a>/i) || [])[1];
-    const artist = (block.match(/<label[^>]*>([\s\S]*?)<\/label>/i) || [])[1];
-    const t = clean(stripTags(title));
-    const a = clean(stripTags(artist));
-    if (t || a) out.push({ title: t, artist: a });
-  }
-
-  if (!out.length) {
-    const plain = stripTags(txt);
-    const first = plain.split(/\s{2,}|\n/).find(Boolean) || plain;
-    const seps = [" - ", " — ", " – ", " | ", ": "];
-    for (const sep of seps) {
-      const i = first.indexOf(sep);
-      if (i > 0) {
-        out.push({ artist: first.slice(0, i).trim(), title: first.slice(i + sep.length).trim() });
-        break;
-      }
+const splitSong = (s = '') => {
+  // separadores comunes: " - ", " – ", "-" (con espacios), " | "
+  const seps = [' - ', ' – ', ' — ', ' | '];
+  for (const sep of seps) {
+    const i = s.indexOf(sep);
+    if (i > 0) {
+      return { artist: s.slice(0, i).trim(), title: s.slice(i + sep.length).trim() };
     }
   }
-  return out;
-}
+  return { artist: '', title: s.trim() };
+};
 
-/* =================== Resolver URL del stream =================== */
-let cachedUrl = null;
-let cachedAt = 0;
-const CACHE_MS = 90_000;
+// ---------- Rutas ----------
 
-async function resolveUpstreamURL() {
-  const now = Date.now();
-  if (cachedUrl && now - cachedAt < CACHE_MS) return cachedUrl;
+// Salud / info
+app.get('/', (_req, res) => {
+  CORS(res);
+  res.type('text/plain').send('radio-backend ok');
+});
 
-  const { text: html } = await fetchTextSmart(STATION_PAGE, {
-    headers: {
-      "User-Agent": UA,
-      Accept: "text/html,*/*",
-      "Accept-Language": "es-MX,es;q=0.9,en;q=0.8",
-      Connection: "keep-alive",
-    },
-  });
+// Canción actual (usa el endpoint público del proveedor y normaliza)
+app.get('/now', async (_req, res) => {
+  CORS(res);
+  res.type('application/json; charset=utf-8');
 
-  let m = html.match(/id=["']urladdress["'][^>]*>\s*([^<\s][^<]*?)\s*<\/div>/i);
-  if (m && m[1]) {
-    const url = m[1].trim();
-    if (url.startsWith("http")) {
-      cachedUrl = url;
-      cachedAt = now;
-      return url;
-    }
-  }
-  m = html.match(/https?:\/\/[^\s"'<>]+live\.mp3\?typeportmount=[^"'<>\s]+/i);
-  if (m) {
-    cachedUrl = m[0];
-    cachedAt = now;
-    return cachedUrl;
-  }
-
-  cachedUrl = "http://uk5freenew.listen2myradio.com:6345/;stream.mp3";
-  cachedAt = now;
-  return cachedUrl;
-}
-
-/* =================== Endpoints =================== */
-app.get("/", (_req, res) => res.type("text/plain").send("OK"));
-
-// ---- /now con decodificación segura (adiós mojibake) ----
-app.get("/now", async (_req, res) => {
   try {
-    const { text, contentType } = await fetchTextSmart(RADIO_AJAX, {
-      method: "POST",
+    // 1) Fuente AJAX del proveedor (la que ya te funcionaba)
+    // Nota: responden con HTML/JSON según momento; normalizamos siempre a texto y parseamos.
+    const ajaxURL = 'https://hombresg.radio12345.com/getRecentSong.ajax.php';
+
+    const r = await fetch(ajaxURL, {
+      ...undiciOpts,
+      method: 'POST',
+      // simula el request de su web (algunos WAF lo prefieren)
       headers: {
-        "User-Agent": UA,
-        Accept: "application/json,text/html,*/*",
-        "Content-Type": "application/x-www-form-urlencoded",
-        Origin: "https://hombresg.radio12345.com",
-        Referer: "https://hombresg.radio12345.com/",
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+        'X-Requested-With': 'XMLHttpRequest',
+        'User-Agent': 'Mozilla/5.0 (Compatible; RadioOK/1.0)',
+        'Origin': 'https://hombresg.radio12345.com',
+        'Referer': 'https://hombresg.radio12345.com/index.php',
       },
-      body: "x=1",
+      body: new URLSearchParams({ page_level: 'desktop' }).toString(),
     });
 
-    let items = [];
-    if ((contentType || "").includes("application/json")) {
-      try {
-        const j = JSON.parse(text);
-        if (j && j.html) items = parseFromHtml(j.html);
-        if (!items.length && Array.isArray(j.history)) {
-          for (const h of j.history) {
-            const t = clean(h.title || h.song || "");
-            const a = clean(h.artist || "");
-            if (t || a) items.push({ title: t, artist: a });
-          }
-        }
-        // bitrate si viene en json (a veces no aplica):
-        const bitrate = clean(j?.bitrate || "");
-        const now = items[0] || { artist: "", title: "" };
-        res.setHeader("Access-Control-Allow-Origin", "*");
-        res.type("application/json; charset=utf-8").send(
-          JSON.stringify({ artist: now.artist, title: now.title, bitrate, source: "ajax-json" })
-        );
-        return;
-      } catch {
-        // caemos a parseo HTML/texto
+    const ct = r.headers.get('content-type') || '';
+    let raw = await r.arrayBuffer();
+    let txt;
+
+    // ellos a veces emiten ISO-8859-1; intentamos UTF-8 y si hay carácter inválido
+    // caemos a cp1252 para arreglar acentos
+    try {
+      txt = new TextDecoder('utf-8', { fatal: true }).decode(raw);
+    } catch {
+      txt = iconv.decode(Buffer.from(raw), 'win1252'); // latin1/cp1252 tolerante
+    }
+
+    let artist = '';
+    let title = '';
+    let bitrate = '';
+
+    // 2) Cuando devuelven JSON con fragmento HTML
+    if (ct.includes('application/json') || txt.trim().startsWith('{')) {
+      let data;
+      try { data = JSON.parse(txt); } catch { data = null; }
+
+      if (data && typeof data.html === 'string') {
+        // HTML tiene <a>título</a><label>artista</label> y <strong>hh:mm:ss</strong>
+        const mTitle = data.html.match(/<a[^>]*>\s*([^<]+)\s*<\/a>/i);
+        const mArtist = data.html.match(/<label[^>]*>\s*([^<]+)\s*<\/label>/i);
+        title = clean(mTitle?.[1] || '');
+        artist = clean(mArtist?.[1] || '');
       }
     }
 
-    // respuesta text/html: parsea HTML
-    items = parseFromHtml(text);
-    const now = items[0] || { artist: "", title: "" };
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.type("application/json; charset=utf-8").send(
-      JSON.stringify({ artist: now.artist, title: now.title, bitrate: "", source: "v7.html" })
-    );
+    // 3) Fallback: intenta “título - artista” si vino como texto plano
+    if (!title && !artist) {
+      const line = clean(txt);
+      const { artist: a, title: t } = splitSong(line);
+      artist = a; title = t;
+    }
+
+    // 4) Como último recurso, deja texto completo en title
+    if (!title && !artist) {
+      title = clean(txt);
+    }
+
+    // Puedes fijar bitrate estático si tu salida siempre es 128 kbps
+    // o dejarlo vacío
+    bitrate = '128 kbps';
+
+    return res.json({
+      artist, title, bitrate, source: 'r7.html',
+    });
   } catch (err) {
-    res
-      .status(502)
-      .type("application/json; charset=utf-8")
-      .send(JSON.stringify({ artist: "", title: "", source: "error", msg: String(err) }));
+    return res.status(502).json({
+      artist: '', title: '', bitrate: '', error: 'now-failed', detail: String(err?.message || err),
+    });
   }
 });
 
-// ---- /diag ----
-app.get("/diag", async (_req, res) => {
-  try {
-    const url = await resolveUpstreamURL();
-    const r = await fetch(url, {
-      dispatcher: agent,
-      method: "GET",
-      headers: {
-        "User-Agent": UA,
-        Accept: "*/*",
-        "Accept-Language": "es-MX,es;q=0.9,en;q=0.8",
-        "Icy-MetaData": "0",
-        Connection: "keep-alive",
-        Referer: "https://hombresgradio.com/",
-        Origin: "https://hombresgradio.com",
-      },
-    });
-    const reader = r.body?.getReader?.();
-    let bytes = 0;
-    if (reader) {
-      while (bytes < 65536) {
-        const chunk = await reader.read();
-        if (chunk.done) break;
-        if (chunk.value) bytes += chunk.value.byteLength;
-      }
-    }
-    res.json({
-      ok: r.ok,
-      status: r.status,
-      ct: r.headers.get("content-type"),
-      bytes,
-      urlUsed: url,
-      cachedAgeMs: Date.now() - cachedAt,
-    });
-  } catch (e) {
-    res.status(502).json({ ok: false, error: String(e) });
-  }
-});
+// Proxy del stream para esquivar CORS/SSL y entregar audio/mpeg
+app.get('/stream', async (req, res) => {
+  CORS(res);
 
-// ---- /stream ----
-app.get("/stream", async (req, res) => {
-  res.setHeader("Content-Type", "audio/mpeg");
-  res.setHeader("Content-Disposition", 'inline; filename="live.mp3"');
-  res.setHeader("Cache-Control", "no-store, no-transform, must-revalidate");
-  res.setHeader("Pragma", "no-cache");
-  res.setHeader("Accept-Ranges", "none");
-  res.setHeader("Access-Control-Allow-Origin", "*");
-
-  const ac = new AbortController();
-  const onClose = () => ac.abort();
-  req.on("close", onClose);
-  req.on("aborted", onClose);
+  // Tu URL del proveedor (no se expone en el HTML del cliente):
+  const upstream = 'https://uk5freenew.listen2myradio.com/live.mp3?typeportmount=s1_6345_stream_898887520';
 
   try {
-    const upstreamURL = await resolveUpstreamURL();
-    const upstream = await fetch(upstreamURL, {
-      dispatcher: agent,
-      method: "GET",
+    // Pasar Range si el navegador lo envía (seek, prebuffer)
+    const range = req.headers.range;
+
+    const { body, statusCode, headers } = await request(upstream, {
+      ...undiciOpts,
+      method: 'GET',
       headers: {
-        "User-Agent": UA,
-        Accept: "*/*",
-        "Accept-Language": "es-MX,es;q=0.9,en;q=0.8",
-        "Icy-MetaData": "0",
-        Connection: "keep-alive",
-        Referer: "https://hombresgradio.com/",
-        Origin: "https://hombresgradio.com",
+        'User-Agent': 'Mozilla/5.0 (Compatible; RadioOK/1.0)',
+        'Icy-MetaData': '1',
+        ...(range ? { Range: range } : {}),
       },
-      signal: ac.signal,
+      // El stream es chunked/long-lived:
+      bodyTimeout: 0,
+      headersTimeout: 0,
+      maxRedirections: 2,
     });
 
-    if (!upstream.ok || !upstream.body) {
-      res.status(502).json({ error: "upstream", code: upstream.status });
-      return;
-    }
-
-    res.flushHeaders?.();
-    const nodeStream = Readable.fromWeb(upstream.body);
-    nodeStream.on("error", () => {
-      if (!res.headersSent) res.status(502);
-      res.end();
+    // Cabeceras hacia el cliente
+    res.status(statusCode === 206 ? 206 : 200);
+    res.set({
+      'Content-Type': 'audio/mpeg',
+      'Cache-Control': 'no-store, no-transform, must-revalidate, max-age=0',
+      'Connection': 'keep-alive',
+      'Accept-Ranges': 'bytes',
+      // Si el origen devolvió Content-Range y pedimos Range, propágalo
+      ...(headers['content-range'] ? { 'Content-Range': headers['content-range'] } : {}),
+      ...(headers['content-length'] ? { 'Content-Length': headers['content-length'] } : {}),
+      // Opcional: exponer cabeceras
+      'Access-Control-Expose-Headers': 'Accept-Ranges, Content-Length, Content-Range',
     });
-    res.on("error", () => ac.abort());
 
-    nodeStream.pipe(res);
+    // Pipe sin cierre prematuro
+    body.on('error', (e) => {
+      try { res.destroy(e); } catch (_) {}
+    });
+    req.on('close', () => {
+      try { body.destroy(); } catch (_) {}
+    });
+
+    body.pipe(res);
   } catch (err) {
-    if (!res.headersSent) {
-      res.status(502).json({ error: "proxy", msg: String(err) });
-    } else {
-      res.end();
-    }
+    res.status(502).json({ error: 'stream-failed', detail: String(err?.message || err) });
   }
 });
 
-/* Puerto */
+// ---------- Start ----------
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("radio backend listening on", PORT));
+app.listen(PORT, '0.0.0.0', () => {
+  // Render necesita que escuches en process.env.PORT
+  console.log(`radio backend listening on ${PORT}`);
+});
