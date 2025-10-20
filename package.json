@@ -1,6 +1,6 @@
 {
-  "name": "radio-backend-minimal",
-  "version": "1.0.0",
+  "name": "radio-backend",
+  "version": "1.0.2",
   "private": true,
   "type": "module",
   "engines": {
@@ -9,5 +9,8 @@
   "scripts": {
     "start": "node server.mjs"
   },
-  "dependencies": {}
+  "dependencies": {
+    "express": "^4.19.2",
+    "iconv-lite": "^0.6.3"
+  }
 }
