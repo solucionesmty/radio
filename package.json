@@ -1,16 +1,16 @@
 {
-  "name": "radio-backend",
+{
+  "name": "radio-ok",
   "version": "1.0.0",
-  "description": "Backend mínimo para now/stream de Hombres G Radio",
+  "private": true,
   "type": "module",
+  "engines": {
+    "node": "22.x"
+  },
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
     "undici": "^6.19.8"
-  },
-  "engines": {
-    "node": "22.x"
   }
 }
