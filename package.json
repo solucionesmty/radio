@@ -1,13 +1,12 @@
 {
   "name": "radio-ok",
-  "private": true,
-  "type": "commonjs",
   "version": "1.0.0",
-  "engines": {
-    "node": "^20 || ^22"
-  },
+  "type": "commonjs",
+  "private": true,
   "scripts": {
     "start": "node server.cjs"
   },
-  "dependencies": {}
+  "dependencies": {
+    "undici": "^6.19.8"
+  }
 }
