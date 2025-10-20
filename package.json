@@ -1,16 +1,15 @@
 {
   "name": "radio-backend",
-  "version": "1.0.2",
   "private": true,
+  "version": "1.0.0",
   "type": "module",
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "scripts": {
     "start": "node server.mjs"
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "iconv-lite": "^0.6.3"
+    "undici": "^6.19.8"
   }
 }
