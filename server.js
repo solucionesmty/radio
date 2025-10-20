@@ -6,6 +6,10 @@ import { Readable } from 'node:stream';
 const app = express();
 const PORT = process.env.PORT || 10000;
 
+// --- health check
+app.get('/health', (_req, res) => res.status(200).send('ok'));
+
+
 // Configura tus URLs en variables de entorno en Render
 const UPSTREAM_STREAM = process.env.UPSTREAM_STREAM; // ej: https://uk5freenew.listen2myradio.com/live.mp3?typeportmount=...
 const UPSTREAM_STATUS = process.env.UPSTREAM_STATUS || UPSTREAM_STREAM;
@@ -118,3 +122,4 @@ app.get('/stream', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`radio backend listening on ${PORT}`);
 });
+
