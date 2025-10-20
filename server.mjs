@@ -6,6 +6,7 @@ import http from 'node:http';
 import https from 'node:https';
 import express from 'express';
 import { Readable } from 'node:stream';
+import iconv from 'iconv-lite';
 
 const app = express();
 
@@ -35,6 +36,19 @@ app.use((req, res, next) => {
 });
 
 // -------- Utilidades --------
+function cleanMojibake(s = '') {
+  return s.replace(/\uFFFD/g, '�').normalize('NFC').trim();
+}
+
+function stripCsvNumbers(s = '') {
+  const parts = s.split(',').map(p => p.trim());
+  if (parts.length <= 1) return s;
+  let idx = 0;
+  while (idx < parts.length && /^[0-9]+$/.test(parts[idx])) idx++;
+  const rest = parts.slice(idx).join(',').trim();
+  return rest || s;
+}
+
 function splitSong(str = '') {
   const s = String(str).trim();
   if (!s) return { artist: '', title: '' };
@@ -43,13 +57,10 @@ function splitSong(str = '') {
     const i = s.indexOf(sep);
     if (i > -1) return { artist: s.slice(0, i).trim(), title: s.slice(i + sep.length).trim() };
   }
-  const j = s.indexOf(',');
-  if (j > -1) return { artist: s.slice(0, j).trim(), title: s.slice(j + 1).trim() };
   return { artist: '', title: s };
 }
 
 function parseNowText(txt) {
-  // 1) JSON directo (si lo hay)
   try {
     const j = JSON.parse(txt);
     const a = (j.artist || '').toString();
@@ -58,15 +69,13 @@ function parseNowText(txt) {
     if (a || t) return { artist: a, title: t, bitrate: br, source: 'json' };
   } catch {}
 
-  // 2) HTML simple / 7.html
-  const cleaned = txt.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
-  const bySep = splitSong(cleaned);
-  if (bySep.title || bySep.artist) return { ...bySep, bitrate: '', source: '7.html' };
-
-  return { artist: '', title: '', bitrate: '', source: 'unknown' };
+  const withoutTags = txt.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+  const noCsv = stripCsvNumbers(withoutTags);
+  const { artist, title } = splitSong(noCsv);
+  return { artist, title, bitrate: '', source: '7.html' };
 }
 
-async function fetchWithTimeout(url, opts = {}, ms = 6000) {
+async function fetchWithTimeout(url, opts = {}, ms = 8000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), ms);
   try {
@@ -96,32 +105,27 @@ app.get('/health', (_req, res) => {
 app.get('/now', async (_req, res) => {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   if (!STATUS_URL) {
-    return res.end(
-      JSON.stringify({
-        artist: '',
-        title: '',
-        bitrate: '',
-        source: 'misconfig',
-        error: 'Missing UPSTREAM_STATUS_URL',
-      }),
-    );
+    return res.end(JSON.stringify({artist:'',title:'',bitrate:'',source:'misconfig',error:'Missing UPSTREAM_STATUS_URL'}));
   }
   try {
-    const r = await fetchWithTimeout(STATUS_URL, {}, 8000);
-    const text = await r.text();
+    const r = await fetchWithTimeout(STATUS_URL, {}, 10000);
+    const ab = await r.arrayBuffer();
+    let buf = Buffer.from(ab);
+    const ctype = r.headers.get('content-type') || '';
+    let text;
+    if (!/utf-?8/i.test(ctype)) {
+      try { text = iconv.decode(buf, 'win1252'); } catch { text = buf.toString('utf8'); }
+    } else {
+      text = buf.toString('utf8');
+    }
+    text = cleanMojibake(text);
     const parsed = parseNowText(text);
-    if (!parsed.title && FALLBACK_TITLE) parsed.title = FALLBACK_TITLE; // backup
+    if (!parsed.title && FALLBACK_TITLE) parsed.title = FALLBACK_TITLE;
+    parsed.artist = parsed.artist.normalize('NFC');
+    parsed.title  = parsed.title.normalize('NFC');
     res.end(JSON.stringify(parsed));
   } catch (err) {
-    res.end(
-      JSON.stringify({
-        artist: '',
-        title: FALLBACK_TITLE || '',
-        bitrate: '',
-        source: 'error',
-        error: String(err?.message || err),
-      }),
-    );
+    res.end(JSON.stringify({artist:'',title:FALLBACK_TITLE||'',bitrate:'',source:'error',error:String(err?.message||err)}));
   }
 });
 
@@ -132,25 +136,15 @@ app.get('/stream', async (req, res) => {
   }
   res.setHeader('Content-Type', 'audio/mpeg');
   res.setHeader('Cache-Control', 'no-store');
-
   const headers = {};
-  if (req.headers.range) headers.Range = req.headers.range; // para saltar/continuar
-
+  if (req.headers.range) headers.Range = req.headers.range;
   try {
     const upstream = await fetchWithTimeout(STREAM_URL, { headers }, 15000);
     res.status(upstream.status);
-
-    // Propagamos algunos headers útiles
-    const ct = upstream.headers.get('content-type');
-    if (ct) res.setHeader('Content-Type', ct);
-    const ar = upstream.headers.get('accept-ranges');
-    if (ar) res.setHeader('Accept-Ranges', ar);
-    const cr = upstream.headers.get('content-range');
-    if (cr) res.setHeader('Content-Range', cr);
-
-    const body = upstream.body;
-    if (!body) return res.end();
-
+    const ct = upstream.headers.get('content-type'); if (ct) res.setHeader('Content-Type', ct);
+    const ar = upstream.headers.get('accept-ranges'); if (ar) res.setHeader('Accept-Ranges', ar);
+    const cr = upstream.headers.get('content-range'); if (cr) res.setHeader('Content-Range', cr);
+    const body = upstream.body; if (!body) return res.end();
     const nodeReadable = Readable.fromWeb(body);
     nodeReadable.on('error', () => res.end());
     nodeReadable.pipe(res);
@@ -160,10 +154,7 @@ app.get('/stream', async (req, res) => {
   }
 });
 
-// -------- Start --------
 http.globalAgent.keepAlive = true;
 https.globalAgent.keepAlive = true;
 
-app.listen(PORT, () => {
-  console.log(`radio backend listening on ${PORT}`);
-});
+app.listen(PORT, () => console.log(`radio backend listening on ${PORT}`));
