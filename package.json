@@ -1,12 +1,13 @@
 {
   "name": "radio-ok",
   "version": "1.0.0",
-  "private": true,
+  "description": "NOW proxy for SHOUTcast 7.html",
   "main": "server.cjs",
+  "type": "commonjs",
   "scripts": {
     "start": "node server.cjs"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=20.0.0"
   }
 }
