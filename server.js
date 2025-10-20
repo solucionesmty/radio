@@ -1,125 +1,144 @@
-// server.js
 import express from 'express';
-import { Agent, fetch } from 'undici';
+import { Agent } from 'undici';
 import { Readable } from 'node:stream';
 
-const app = express();
+// ---------- Config por variables de entorno ----------
 const PORT = process.env.PORT || 10000;
 
-// --- health check
-app.get('/health', (_req, res) => res.status(200).send('ok'));
+// URL HTTPS del stream real (la de listen2myradio que funciona en navegador)
+// EJEMPLO: https://uk5freenew.listen2myradio.com/live.mp3?typeportmount=s1_6345_stream_898887520
+const UPSTREAM_STREAM = process.env.UPSTREAM_STREAM;
 
+// Lista de endpoints de estado (coma separada). Ideal 7.html o 7?sid=1
+// EJEMPLO: http://uk5freenew.listen2myradio.com:6345/7.html,http://uk5freenew.listen2myradio.com:6345/7?sid=1
+const STATUS_URLS = (process.env.STATUS_URLS || '').split(',').map(s => s.trim()).filter(Boolean);
 
-// Configura tus URLs en variables de entorno en Render
-const UPSTREAM_STREAM = process.env.UPSTREAM_STREAM; // ej: https://uk5freenew.listen2myradio.com/live.mp3?typeportmount=...
-const UPSTREAM_STATUS = process.env.UPSTREAM_STATUS || UPSTREAM_STREAM;
+// CORS: deja vacío para *, o pon https://hombresgradio.com
+const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
 
-// Agente keep-alive hacia el host de Listen2MyRadio
-const upstreamAgent = new Agent({
-  connect: { timeout: 15_000 },
-  keepAliveTimeout: 60_000,
-  keepAliveMaxTimeout: 120_000
-});
+// Timeout de fetch al upstream (ms)
+const TIMEOUT_MS = Number(process.env.TIMEOUT_MS || 12000);
+
+// Undici Agent (mejor manejo de conexiones)
+const agent = new Agent({ connect: { timeout: TIMEOUT_MS } });
 
 // ---------- Utilidades ----------
-function noStore(res) {
-  res.setHeader('Cache-Control', 'no-store, no-transform, must-revalidate');
-  res.setHeader('Pragma', 'no-cache');
-  res.setHeader('Expires', '0');
+function cors(res) {
+  res.setHeader('Access-Control-Allow-Origin', CORS_ORIGIN);
+  res.setHeader('Access-Control-Allow-Methods', 'GET,HEAD,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Range, Accept, Content-Type');
 }
 
-function passHeader(res, name, value) {
-  if (!value) return;
-  res.setHeader(name, value);
-}
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-function isOk(status) { return status >= 200 && status < 300; }
-
-// ---------- “Now playing” sencillo (ya lo tienes, dejo uno minimal) ----------
-app.get('/now', async (req, res) => {
+async function fetchWithTimeout(url, opts = {}) {
+  const ctrl = new AbortController();
+  const to = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
   try {
-    const r = await fetch(UPSTREAM_STATUS, {
-      method: 'GET',
-      dispatcher: upstreamAgent,
-      headers: { 'User-Agent': 'HGRadio-Backend/1.0', 'Accept': '*/*' }
-    });
-    // Aquí parseas lo que ya tenías; devuelvo dummy si no hay nada
-    res.set('content-type', 'application/json; charset=utf-8');
-    noStore(res);
-    return res.status(200).send(JSON.stringify({ artist: '', title: '', bitrate: '128 kbps', source: 'status' }));
-  } catch (e) {
-    res.set('content-type', 'application/json; charset=utf-8');
-    noStore(res);
-    return res.status(200).send(JSON.stringify({ artist: '', title: '', bitrate: '', source: 'error' }));
+    const r = await fetch(url, { dispatcher: agent, signal: ctrl.signal, ...opts });
+    return r;
+  } finally {
+    clearTimeout(to);
   }
-});
+}
 
-// ---------- Wake: HEAD/GET rápido para “despertar” el upstream ----------
-app.get('/wake', async (req, res) => {
+// convierte un ArrayBuffer que viene en ISO-8859-1 a UTF-8 legible
+function latin1ToString(buf) {
   try {
-    const r = await fetch(UPSTREAM_STATUS, {
-      method: 'HEAD',
-      dispatcher: upstreamAgent,
-      headers: { 'User-Agent': 'HGRadio-Backend/1.0', 'Accept': '*/*' }
-    });
-    noStore(res);
-    return res.status(isOk(r.status) ? 200 : 502).send('ok');
+    return new TextDecoder('latin1').decode(buf);
   } catch {
-    noStore(res);
-    return res.status(502).send('bad');
+    return Buffer.from(buf).toString('latin1');
   }
+}
+
+function clean(s) {
+  return (s || '')
+    .replace(/\r/g, '')
+    .replace(/\u0000/g, '')
+    .trim();
+}
+
+function splitArtistTitle(line) {
+  // formatos comunes: "Artista - Título" / "Artista – Título"
+  const m = line.split(/\s[-–]\s/);
+  if (m.length >= 2) return { artist: m[0].trim(), title: m.slice(1).join(' - ').trim() };
+  return { artist: '', title: clean(line) };
+}
+
+// ---------- App ----------
+const app = express();
+
+// health check para Render
+app.get('/health', (_req, res) => {
+  cors(res);
+  res.status(200).type('text/plain').send('ok');
 });
 
-// ---------- Proxy de stream con soporte Range ----------
+// Devuelve canción actual, bitrate (si se puede) y fuente usada
+app.get('/now', async (_req, res) => {
+  cors(res);
+
+  // Intento: leer 7.html / 7?sid=1 y parsear la línea del tema actual
+  for (const url of STATUS_URLS) {
+    try {
+      const r = await fetchWithTimeout(url, { headers: { 'User-Agent': 'RadioOK/1.0' } });
+      if (!r.ok) continue;
+
+      const ab = await r.arrayBuffer();
+      const txt = latin1ToString(ab);
+
+      // Shoutcast 1.x suele incluir líneas tipo:
+      // "Current Song: Hombre real - Hombres G" o una tabla con "Current Song"
+      let line =
+        (txt.match(/Current Song:\s*([^\n<]+)/i) || [])[1] ||
+        (txt.match(/Stream Title:\s*([^\n<]+)/i) || [])[1] ||
+        '';
+
+      if (!line) {
+        // otro formato: lista con artista <label> y titulo dentro de <a>
+        const a = (txt.match(/<div class=["']list_title["'][^>]*>\s*<a[^>]*>([^<]+)<\/a>[\s\S]*?<label[^>]*>([^<]+)<\/label>/i) || []);
+        if (a.length >= 3) line = `${a[2]} - ${a[1]}`;
+      }
+
+      line = clean(line);
+      if (line) {
+        const { artist, title } = splitArtistTitle(line);
+        return res.json({
+          artist, title,
+          bitrate: '',
+          source: url.split('?')[0].split('/').pop() // 7.html o 7
+        });
+      }
+    } catch {
+      // siguiente candidato
+    }
+  }
+
+  // Fallback si nada funcionó: devuelve vacío
+  res.json({ artist: '', title: '', bitrate: '', source: 'none' });
+});
+
+// Proxy del stream MP3 con soporte Range (para que el <audio> funcione bien)
 app.get('/stream', async (req, res) => {
-  const range = req.headers.range;
-  const headers = {
-    'User-Agent': 'HGRadio-Backend/1.0',
-    'Accept': '*/*',
-    // No pedimos ICY metadata para evitar complicaciones con navegadores
-    'Icy-MetaData': '0'
-  };
-  if (range) headers.Range = range;
+  cors(res);
 
-  noStore(res);
-
-  const controller = new AbortController();
-  req.on('close', () => controller.abort());
-
-  let r;
-  try {
-    r = await fetch(UPSTREAM_STREAM, {
-      method: 'GET',
-      dispatcher: upstreamAgent,
-      headers,
-      signal: controller.signal
-    });
-  } catch (e) {
-    res.status(502).end();
-    return;
+  if (!UPSTREAM_STREAM) {
+    return res.status(500).json({ error: 'missing UPSTREAM_STREAM' });
   }
 
-  // Transferimos cabeceras críticas para playback
-  passHeader(res, 'Content-Type', r.headers.get('content-type') || 'audio/mpeg');
-  passHeader(res, 'Accept-Ranges', r.headers.get('accept-ranges'));
-  passHeader(res, 'Content-Range', r.headers.get('content-range'));
-  passHeader(res, 'Content-Length', r.headers.get('content-length'));
-  passHeader(res, 'Connection', 'keep-alive');
-  passHeader(res, 'X-Accel-Buffering', 'no');
+  try {
+    const headers = {
+      'User-Agent': 'RadioOK/1.0',
+      // si el navegador pide Range, lo pasamos al upstream
+      ...(req.headers.range ? { Range: req.headers.range } : {})
+    };
 
-  res.status(r.status); // puede ser 200 o 206
+    const r = await fetchWithTimeout(UPSTREAM_STREAM, {
+      headers,
+      // no seguimos redirects con streaming por seguridad
+      redirect: 'follow'
+    });
 
-  const body = r.body;
-  if (!body) { res.end(); return; }
-
-  // Pipe estable Web->Node->Cliente
-  Readable.fromWeb(body).on('error', () => {
-    if (!res.headersSent) res.status(502);
-    res.end();
-  }).pipe(res);
-});
-
-app.listen(PORT, () => {
-  console.log(`radio backend listening on ${PORT}`);
-});
-
+    // Copia los headers importantes hacia el cliente
+    const ct = r.headers.get('content-type') || 'audio/mpeg';
+    const
