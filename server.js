@@ -1,227 +1,220 @@
 // server.js
-// Backend mínimo para /now (metadatos) y /stream (proxy MP3) con CORS y healthcheck.
-// Node 22 + ESM. Dep: undici.
+// Node 18+ (Render usa 22.x). Sin dependencias externas.
 
-import http from 'node:http';
-import { request } from 'undici';
+const http = require('http');
+const https = require('https');
+const express = require('express');
 
-// ------------------------
-// Config vía variables de entorno
-// ------------------------
-const PORT = Number(process.env.PORT || 10000);
+const app = express();
 
-// MP3 SSL del proveedor (el que funciona en tu web):
-// p.ej: https://uk5freenew.listen2myradio.com/live.mp3?typeportmount=s1_6345_stream_898887520
-const UPSTREAM_STREAM = process.env.UPSTREAM_STREAM || '';
+// ---------- Config ----------
+const PORT = process.env.PORT || 10000;
+const STATUS_URL = process.env.UPSTREAM_STATUS_URL || '';
+const STREAM_URL = process.env.STREAM_URL || '';
+const FALLBACK_TITLE = process.env.FALLBACK_TITLE || '';
+const ALLOW_ORIGINS = (process.env.CORS_ORIGINS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
 
-/**
- * Lista de endpoints de estado (coma separados). Se prueban en orden:
- *  - 7.html          -> Shoutcast 1.x
- *  - 7?sid=1         -> cuando hay múltiples mounts
- *  - status-json.xsl -> Shoutcast 2 (si lo tienes)
- *  - index.html      -> fallback HTML para intentar extraer "Current Song"
- */
-const STATUS_URLS = (process.env.STATUS_URLS || '').split(',').map(s => s.trim()).filter(Boolean);
-
-// CORS
-const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
-
-// UA para endpoints “quisquillosos”
-const UA = 'Mozilla/5.0 (compatible; RadioOK/1.0; +https://radio-ok.onrender.com)';
-
-// ------------------------
-// Utilidades
-// ------------------------
-function cors(res) {
-  res.setHeader('Access-Control-Allow-Origin', CORS_ORIGIN);
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+// ---------- CORS (lista blanca) ----------
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (ALLOW_ORIGINS.length === 0) {
+    // Para pruebas: permite todo si no configuraste lista blanca
+    res.setHeader('Access-Control-Allow-Origin', '*');
+  } else if (origin && ALLOW_ORIGINS.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+  }
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-}
 
-function json(res, obj, code = 200) {
-  const body = Buffer.from(JSON.stringify(obj), 'utf8');
-  res.statusCode = code;
-  res.setHeader('Content-Type', 'application/json; charset=utf-8');
-  res.setHeader('Cache-Control', 'no-store');
-  cors(res);
-  res.end(body);
-}
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+  next();
+});
 
-function splitArtistTitle(song) {
-  // Formatos comunes: "Artista - Título", "Artista – Título", "Artista: Título"
-  const sep = [' - ', ' – ', ' — ', ' — ', ' —', ' –', ' – ', ' — ', ' : ', ': '];
-  for (const s of sep) {
-    const i = song.indexOf(s);
-    if (i > 0) {
+// ---------- Utilidades ----------
+function splitSong(str = '') {
+  const s = String(str).trim();
+  if (!s) return { artist: '', title: '' };
+
+  // separadores más comunes
+  const seps = [' - ', ' – ', ' — ', ' — ', ' — ', ' | ', ' ~ '];
+  for (const sep of seps) {
+    const i = s.indexOf(sep);
+    if (i > -1) {
       return {
-        artist: song.slice(0, i).trim(),
-        title: song.slice(i + s.length).trim()
+        artist: s.slice(0, i).trim(),
+        title: s.slice(i + sep.length).trim(),
       };
     }
   }
-  return { artist: '', title: song.trim() };
-}
-
-// 7.html de Shoutcast: devuelve una única línea con campos separados por coma.
-// Campo 6/7 suele ser la canción.
-function parse7Html(text) {
-  const line = String(text).trim();
-  const parts = line.split(',').map(s => s.trim());
-  // formatos típicos:
-  // v1: listeners,peak,max,reported,bitrate,song
-  // v2: listeners,peak,max,reported,bitrate,?,song
-  const song = parts[6] || parts[5] || '';
-  const { artist, title } = splitArtistTitle(song);
-  const br = (parts[4] && /^\d+$/.test(parts[4])) ? `${parts[4]} kbps` : '';
-  return { artist, title, bitrate: br, source: '7.html' };
-}
-
-// status-json.xsl de Shoutcast 2.*
-function parseStatusJsonXsl(obj) {
-  try {
-    const s = obj?.streamstatus;
-    if (s === 1 || s === '1' || s === 'active') {
-      const song = obj?.songtitle || obj?.song || '';
-      const br = obj?.bitrate ? `${obj.bitrate} kbps` : '';
-      const { artist, title } = splitArtistTitle(song);
-      return { artist, title, bitrate: br, source: 'status-json.xsl' };
-    }
-  } catch {}
-  return null;
-}
-
-// Fallback muy básico para index.html de Shoutcast 1.9.x
-function parseIndexHtml(text) {
-  const html = String(text);
-  // Busca "Current Song" (inglés) o "Current Stream Information" y la línea de Song
-  const m = html.match(/Current\s+Song<\/td>\s*<td[^>]*>(.*?)<\/td>/i);
-  const raw = m ? m[1].replace(/<[^>]+>/g, '').trim() : '';
-  if (!raw) return null;
-  const { artist, title } = splitArtistTitle(raw);
-  return { artist, title, bitrate: '', source: 'index.html' };
-}
-
-// Intenta cada STATUS_URL en orden hasta obtener datos válidos
-async function fetchNow() {
-  for (const url of STATUS_URLS) {
-    try {
-      const r = await request(url, {
-        method: 'GET',
-        headers: { 'User-Agent': UA, 'Accept': '*/*' }
-      });
-
-      // content-type nos orienta
-      const ct = String(r.headers['content-type'] || '').toLowerCase();
-      const buf = await r.body.arrayBuffer();
-      const text = Buffer.from(buf).toString('utf8'); // suele venir en utf-8; si no, el proveedor ya lo sirve así
-
-      // status-json.xsl -> JSON
-      if (ct.includes('json') || url.includes('status-json')) {
-        const obj = JSON.parse(text);
-        // 2 variantes: plano o con "data" dentro
-        const hit =
-          parseStatusJsonXsl(obj) ||
-          parseStatusJsonXsl(obj?.data);
-        if (hit && (hit.artist || hit.title)) return hit;
-      }
-
-      // 7.html -> texto plano con comas
-      if (url.endsWith('/7.html') || url.includes('7?sid=')) {
-        const hit = parse7Html(text);
-        if (hit && (hit.artist || hit.title)) return hit;
-      }
-
-      // index.html -> HTML clásico
-      if (url.endsWith('/index.html')) {
-        const hit = parseIndexHtml(text);
-        if (hit && (hit.artist || hit.title)) return hit;
-      }
-    } catch (e) {
-      // continúa con el siguiente candidato
-    }
+  // como fallback, intenta coma
+  const j = s.indexOf(',');
+  if (j > -1) {
+    return {
+      artist: s.slice(0, j).trim(),
+      title: s.slice(j + 1).trim(),
+    };
   }
-  return { artist: '', title: '', bitrate: '', source: 'none' };
+  return { artist: '', title: s };
 }
 
-// ------------------------
-// Servidor HTTP
-// ------------------------
-const server = http.createServer(async (req, res) => {
+function parseNowText(txt) {
+  // 1) JSON directo
   try {
-    // CORS preflight
-    if (req.method === 'OPTIONS') {
-      cors(res);
-      res.statusCode = 204;
-      return res.end();
+    const j = JSON.parse(txt);
+    const a = (j.artist || '').toString();
+    const t = (j.title || '').toString();
+    const br = (j.bitrate || j.bitrate_kbps || '').toString();
+    if (a || t) {
+      return { artist: a, title: t, bitrate: br, source: 'json' };
+    }
+  } catch (_) {}
+
+  // 2) Shoutcast "7.html" (v1/v2) -> suele traer algo con artista - título
+  // A veces la cadena lleva HTML o comas; intentemos limpiar
+  const cleaned = txt
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  // Busca patrones “Artist - Title”
+  const bySep = splitSong(cleaned);
+  if (bySep.title || bySep.artist) {
+    return { ...bySep, bitrate: '', source: '7.html' };
+  }
+
+  // 3) Nada útil
+  return { artist: '', title: '', bitrate: '', source: 'unknown' };
+}
+
+async function fetchWithTimeout(url, opts = {}, ms = 4000) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), ms);
+  try {
+    const res = await fetch(url, {
+      ...opts,
+      signal: controller.signal,
+      // encabezados útiles
+      headers: {
+        'User-Agent':
+          'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36',
+        'Cache-Control': 'no-cache',
+        Pragma: 'no-cache',
+        ...(opts.headers || {}),
+      },
+    });
+    return res;
+  } finally {
+    clearTimeout(id);
+  }
+}
+
+// ---------- Rutas ----------
+app.get('/health', (_req, res) => {
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.end(JSON.stringify({ ok: true }));
+});
+
+app.get('/now', async (_req, res) => {
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+
+  if (!STATUS_URL) {
+    return res.end(JSON.stringify({
+      artist: '',
+      title: '',
+      bitrate: '',
+      source: 'misconfig',
+      error: 'Missing UPSTREAM_STATUS_URL',
+    }));
+  }
+
+  try {
+    const r = await fetchWithTimeout(STATUS_URL, {}, 5000);
+    const text = await r.text();
+
+    const parsed = parseNowText(text);
+    // Rellena title como fallback si no hay datos
+    if (!parsed.title && FALLBACK_TITLE) {
+      parsed.title = FALLBACK_TITLE;
     }
 
-    if (req.url === '/health') {
-      cors(res);
-      res.statusCode = 200;
-      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-      return res.end('ok');
-    }
-
-    if (req.url === '/now') {
-      const data = await fetchNow();
-      return json(res, data);
-    }
-
-    if (req.url === '/stream') {
-      if (!UPSTREAM_STREAM) {
-        return json(res, { error: 'stream-not-configured' }, 500);
-      }
-
-      // Proxifica el MP3
-      const upstream = await request(UPSTREAM_STREAM, {
-        method: 'GET',
-        headers: {
-          'User-Agent': UA,
-          // Evita compresión accidental y headers conflictivos
-          'Accept': '*/*',
-          'Icy-MetaData': '0'
-        },
-        // importa: no sigas redirecciones infinitas si el proveedor cae
-        maxRedirections: 2
-      });
-
-      // Encabezados para el navegador
-      res.statusCode = 200;
-      res.setHeader('Content-Type', 'audio/mpeg');
-      res.setHeader('Cache-Control', 'no-store');
-      // Para que “descargue” si el usuario abre /stream directamente:
-      res.setHeader('Content-Disposition', 'inline; filename="live.mp3"');
-      cors(res);
-
-      // Pipe bruto de bytes
-      upstream.body.on('error', () => {
-        try { res.destroy(); } catch {}
-      });
-      res.on('close', () => {
-        try { upstream.body.destroy(); } catch {}
-      });
-
-      return upstream.body.pipe(res);
-    }
-
-    // 404
-    cors(res);
-    res.statusCode = 404;
-    res.setHeader('Content-Type', 'application/json; charset=utf-8');
-    res.end(JSON.stringify({ error: 'not-found' }));
-
+    // Normaliza UTF-8 (los encabezados ya declaran utf-8)
+    return res.end(JSON.stringify(parsed));
   } catch (err) {
-    // Error guard
-    try {
-      return json(res, { error: 'server', detail: String(err && err.message || err) }, 500);
-    } catch {
-      res.statusCode = 500;
-      res.end('server error');
-    }
+    return res.end(JSON.stringify({
+      artist: '',
+      title: FALLBACK_TITLE || '',
+      bitrate: '',
+      source: 'error',
+      error: String(err && err.message ? err.message : err),
+    }));
   }
 });
 
-// Arranque
-server.listen(PORT, () => {
+app.get('/stream', async (req, res) => {
+  if (!STREAM_URL) {
+    res.status(500).setHeader('Content-Type', 'application/json; charset=utf-8');
+    return res.end(JSON.stringify({ error: 'Missing STREAM_URL' }));
+  }
+
+  // Importante: los navegadores esperan audio/mpeg y soportar "Range"
+  res.setHeader('Content-Type', 'audio/mpeg');
+  res.setHeader('Cache-Control', 'no-store');
+
+  // Pasar Range si el navegador lo envía (mejor compatibilidad)
+  const headers = {};
+  if (req.headers.range) headers.Range = req.headers.range;
+
+  try {
+    const upstream = await fetchWithTimeout(
+      STREAM_URL,
+      { headers },
+      12000 // un poco más generoso para el stream
+    );
+
+    // Propaga status y encabezados relevantes
+    res.status(upstream.status);
+    // Algunos servidores no envían CORS; ya lo manejamos con ACAO arriba
+    const ct = upstream.headers.get('content-type');
+    if (ct) res.setHeader('Content-Type', ct);
+    const acceptRanges = upstream.headers.get('accept-ranges');
+    if (acceptRanges) res.setHeader('Accept-Ranges', acceptRanges);
+    const contentRange = upstream.headers.get('content-range');
+    if (contentRange) res.setHeader('Content-Range', contentRange);
+
+    // Pipe binario
+    if (upstream.body && upstream.body.pipe) {
+      upstream.body.pipe(res);
+    } else {
+      // Node 18 fetch ReadableStream
+      const reader = upstream.body.getReader();
+      const encoder = new TextEncoder();
+
+      async function pump() {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          res.write(Buffer.from(value));
+        }
+        res.end();
+      }
+      pump().catch(() => res.end());
+    }
+  } catch (err) {
+    res.status(502).setHeader('Content-Type', 'application/json; charset=utf-8');
+    return res.end(JSON.stringify({ error: 'upstream', detail: String(err) }));
+  }
+});
+
+// ---------- Arranque ----------
+http.globalAgent.keepAlive = true;
+https.globalAgent.keepAlive = true;
+
+app.listen(PORT, () => {
   console.log(`radio backend listening on ${PORT}`);
 });
