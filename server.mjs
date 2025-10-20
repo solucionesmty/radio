@@ -1,5 +1,6 @@
-// server.mjs — ESM (type:module). Node 18+
-// Rutas: /health, /now, /stream
+// server.mjs — Final ESM build for Render (Node 18+)
+// Rutas:  /health  /now  /stream
+// ENV: UPSTREAM_STATUS_URL, STREAM_URL, CORS_ORIGINS, FALLBACK_TITLE
 
 import http from 'node:http';
 import https from 'node:https';
@@ -8,7 +9,7 @@ import { Readable } from 'node:stream';
 
 const app = express();
 
-// ---------- Config ----------
+// -------- Config --------
 const PORT = process.env.PORT || 10000;
 const STATUS_URL = process.env.UPSTREAM_STATUS_URL || '';
 const STREAM_URL = process.env.STREAM_URL || '';
@@ -18,10 +19,11 @@ const ALLOW_ORIGINS = (process.env.CORS_ORIGINS || '')
   .map(s => s.trim())
   .filter(Boolean);
 
-// ---------- CORS (lista blanca) ----------
+// -------- CORS --------
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   if (ALLOW_ORIGINS.length === 0) {
+    // abierto (útil para pruebas)
     res.setHeader('Access-Control-Allow-Origin', '*');
   } else if (origin && ALLOW_ORIGINS.includes(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
@@ -29,12 +31,11 @@ app.use((req, res, next) => {
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
-// ---------- Utils ----------
+// -------- Utilidades --------
 function splitSong(str = '') {
   const s = String(str).trim();
   if (!s) return { artist: '', title: '' };
@@ -49,7 +50,7 @@ function splitSong(str = '') {
 }
 
 function parseNowText(txt) {
-  // 1) JSON directo
+  // 1) JSON directo (si lo hay)
   try {
     const j = JSON.parse(txt);
     const a = (j.artist || '').toString();
@@ -58,16 +59,15 @@ function parseNowText(txt) {
     if (a || t) return { artist: a, title: t, bitrate: br, source: 'json' };
   } catch {}
 
-  // 2) Shoutcast 7.html u otros HTML/CSV simples
+  // 2) HTML simple / 7.html
   const cleaned = txt.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
   const bySep = splitSong(cleaned);
   if (bySep.title || bySep.artist) return { ...bySep, bitrate: '', source: '7.html' };
 
-  // 3) Nada útil
   return { artist: '', title: '', bitrate: '', source: 'unknown' };
 }
 
-async function fetchWithTimeout(url, opts = {}, ms = 5000) {
+async function fetchWithTimeout(url, opts = {}, ms = 6000) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), ms);
   try {
@@ -88,7 +88,7 @@ async function fetchWithTimeout(url, opts = {}, ms = 5000) {
   }
 }
 
-// ---------- Rutas ----------
+// -------- Rutas --------
 app.get('/health', (_req, res) => {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
   res.end(JSON.stringify({ ok: true }));
@@ -96,33 +96,33 @@ app.get('/health', (_req, res) => {
 
 app.get('/now', async (_req, res) => {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
-
   if (!STATUS_URL) {
-    return res.end(JSON.stringify({
-      artist: '',
-      title: '',
-      bitrate: '',
-      source: 'misconfig',
-      error: 'Missing UPSTREAM_STATUS_URL',
-    }));
+    return res.end(
+      JSON.stringify({
+        artist: '',
+        title: '',
+        bitrate: '',
+        source: 'misconfig',
+        error: 'Missing UPSTREAM_STATUS_URL',
+      }),
+    );
   }
-
   try {
-    const r = await fetchWithTimeout(STATUS_URL, {}, 6000);
+    const r = await fetchWithTimeout(STATUS_URL, {}, 8000);
     const text = await r.text();
-
     const parsed = parseNowText(text);
-    if (!parsed.title && FALLBACK_TITLE) parsed.title = FALLBACK_TITLE;
-
-    return res.end(JSON.stringify(parsed));
+    if (!parsed.title && FALLBACK_TITLE) parsed.title = FALLBACK_TITLE; // backup
+    res.end(JSON.stringify(parsed));
   } catch (err) {
-    return res.end(JSON.stringify({
-      artist: '',
-      title: FALLBACK_TITLE || '',
-      bitrate: '',
-      source: 'error',
-      error: String(err?.message || err),
-    }));
+    res.end(
+      JSON.stringify({
+        artist: '',
+        title: FALLBACK_TITLE || '',
+        bitrate: '',
+        source: 'error',
+        error: String(err?.message || err),
+      }),
+    );
   }
 });
 
@@ -131,39 +131,37 @@ app.get('/stream', async (req, res) => {
     res.status(500).setHeader('Content-Type', 'application/json; charset=utf-8');
     return res.end(JSON.stringify({ error: 'Missing STREAM_URL' }));
   }
-
   res.setHeader('Content-Type', 'audio/mpeg');
   res.setHeader('Cache-Control', 'no-store');
 
   const headers = {};
-  if (req.headers.range) headers.Range = req.headers.range;
+  if (req.headers.range) headers.Range = req.headers.range; // para saltar/continuar
 
   try {
     const upstream = await fetchWithTimeout(STREAM_URL, { headers }, 15000);
-
     res.status(upstream.status);
+
+    // Propagamos algunos headers útiles
     const ct = upstream.headers.get('content-type');
     if (ct) res.setHeader('Content-Type', ct);
-    const acceptRanges = upstream.headers.get('accept-ranges');
-    if (acceptRanges) res.setHeader('Accept-Ranges', acceptRanges);
-    const contentRange = upstream.headers.get('content-range');
-    if (contentRange) res.setHeader('Content-Range', contentRange);
+    const ar = upstream.headers.get('accept-ranges');
+    if (ar) res.setHeader('Accept-Ranges', ar);
+    const cr = upstream.headers.get('content-range');
+    if (cr) res.setHeader('Content-Range', cr);
 
-    // Pipe: Web ReadableStream -> Node response
     const body = upstream.body;
     if (!body) return res.end();
 
-    // Node 18+ util: convertir WebStream a Node Readable
     const nodeReadable = Readable.fromWeb(body);
     nodeReadable.on('error', () => res.end());
     nodeReadable.pipe(res);
   } catch (err) {
     res.status(502).setHeader('Content-Type', 'application/json; charset=utf-8');
-    return res.end(JSON.stringify({ error: 'upstream', detail: String(err?.message || err) }));
+    res.end(JSON.stringify({ error: 'upstream', detail: String(err?.message || err) }));
   }
 });
 
-// ---------- Arranque ----------
+// -------- Start --------
 http.globalAgent.keepAlive = true;
 https.globalAgent.keepAlive = true;
 
