@@ -206,3 +206,22 @@ const server = http.createServer(async (req, res) => {
 
     // 404
     cors(res);
+    res.statusCode = 404;
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.end(JSON.stringify({ error: 'not-found' }));
+
+  } catch (err) {
+    // Error guard
+    try {
+      return json(res, { error: 'server', detail: String(err && err.message || err) }, 500);
+    } catch {
+      res.statusCode = 500;
+      res.end('server error');
+    }
+  }
+});
+
+// Arranque
+server.listen(PORT, () => {
+  console.log(`radio backend listening on ${PORT}`);
+});
