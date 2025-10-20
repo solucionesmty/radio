@@ -1,15 +1,7 @@
 {
-  "name": "radio-ok",
-  "version": "1.0.0",
-  "private": true,
   "type": "module",
-  "engines": {
-    "node": "22.x"
-  },
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.mjs"
   },
-  "dependencies": {
-    "undici": "^6.19.8"
-  }
+  "engines": { "node": ">=18" }
 }
